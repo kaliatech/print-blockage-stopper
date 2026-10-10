@@ -130,7 +130,7 @@ fields = {
     'PRINTER_NAME': p.get('name', 'Unknown'),
     'PRINTER_IP': p.get('ip', ''),
     'PRINTER_MODEL': p.get('model', ''),
-    'PAPER_SIZE': p.get('paper_size', 'A4'),
+    'PAPER_SIZE': p.get('paper_size', 'Letter'),
     'SKIP_HOURS': p.get('skip_hours', 72),
     'IS_PAUSED': p.get('paused', False),
     'VARY_POSITION': p.get('vary_position', False),

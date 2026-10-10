@@ -42,6 +42,8 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 THUMBS_DIR = f"{DATA_DIR}/thumbnails"
 # Set at build time from `git describe` (see Dockerfile).
 APP_VERSION = os.environ.get("APP_VERSION", "unknown")
+# Pre-filled in the Add Printer form
+DEFAULT_PAPER_SIZE = os.environ.get("PAPER_SIZE") or "Letter"
 
 def _configured_tz():
     """The container's time zone name, e.g. America/New_York. Cron uses the same zone."""
@@ -468,7 +470,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "id": printer_id, "name": name, "ip": ip,
             "connection": body.get("connection", "ipp"),
             "port": max(1, min(65535, int(body.get("port", 9100)))),
-            "paper_size": body.get("paper_size", "A4"),
+            "paper_size": body.get("paper_size", DEFAULT_PAPER_SIZE),
             "schedule": body.get("schedule", data["global"]["schedule"]),
             "skip_hours": max(1, min(8760, int(body.get("skip_hours", data["global"]["skip_hours"])))),
             "paused": False,
@@ -919,7 +921,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             <label>Paper size:</label>
             <select class="input-sm select-sm" id="paper-{p["id"]}"
                     onchange="updatePrinter('{p["id"]}', {{paper_size: this.value}})">
-              {"".join(f'<option value="{ps}"{" selected" if ps == p.get("paper_size", "A4") else ""}>{ps}</option>' for ps in ["A4", "Letter", "Legal", "A3", "A5", "B5", "4x6", "5x7"])}
+              {"".join(f'<option value="{ps}"{" selected" if ps == p.get("paper_size", "Letter") else ""}>{ps}</option>' for ps in ["A4", "Letter", "Legal", "A3", "A5", "B5", "4x6", "5x7"])}
             </select>
           </div>
           <div class="control-group">
@@ -1163,7 +1165,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
       </div>
       <div>
         <label for="addPaper">Paper Size</label>
-        <input type="text" id="addPaper" value="A4" maxlength="20">
+        <input type="text" id="addPaper" value="{html_mod.escape(DEFAULT_PAPER_SIZE)}" maxlength="20">
       </div>
       <div>
         <label for="addFreq">Print every</label>
@@ -1506,7 +1508,7 @@ function addPrinter() {{
   api('/api/printers/add', 'POST', {{
     name: document.getElementById('addName').value.trim() || ('Printer at ' + ip),
     ip, connection: document.getElementById('addConn').value,
-    paper_size: document.getElementById('addPaper').value.trim() || 'A4',
+    paper_size: document.getElementById('addPaper').value.trim() || {json.dumps(DEFAULT_PAPER_SIZE)},
     schedule: buildCron(document.getElementById('addFreq').value, document.getElementById('addHour').value)
   }}).then(d => {{
     btn.disabled = false;

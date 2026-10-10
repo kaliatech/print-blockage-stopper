@@ -70,7 +70,7 @@ All settings are optional. Printers can be added entirely from the dashboard.
 | `TZ` | `UTC` | IANA time zone, e.g. `America/New_York`. Schedules, logs, and the dashboard use it. The container exits at startup if the name isn't valid. |
 | `PRINTER_IP` | *(empty)* | Auto-add this printer on first boot |
 | `SCHEDULE` | `0 10 */3 * *` | Default cron schedule |
-| `PAPER_SIZE` | `A4` | Default paper size (A4, Letter, A3, etc.) |
+| `PAPER_SIZE` | `Letter` | Paper size pre-filled when adding a printer (Letter, A4, Legal, etc.) |
 | `SKIP_HOURS` | `72` | Default skip window in hours |
 | `CONNECTION` | `ipp` | Connection type: `ipp` or `socket` |
 | `PRINTER_PORT` | `9100` | Socket port (only with `CONNECTION=socket`) |

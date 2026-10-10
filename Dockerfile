@@ -127,7 +127,7 @@ VOLUME ["/data"]
 # PRINTER_IP:    (Optional) Auto-add this printer on first boot
 # PRINTER_PORT:  Port for socket connection (default 9100)
 # SCHEDULE:      Default cron expression for new printers
-# PAPER_SIZE:    Default media size (A4, Letter, etc.)
+# PAPER_SIZE:    Default media size for new printers (Letter, A4, etc.)
 # CONNECTION:    Default connection type: ipp or socket
 # SKIP_HOURS:    Default skip-if-recently-printed window (hours)
 # WEBHOOK_URL:   (Optional) URL for success/failure notifications
@@ -136,7 +136,7 @@ VOLUME ["/data"]
 ENV PRINTER_IP="" \
     PRINTER_PORT="9100" \
     SCHEDULE="0 10 */3 * *" \
-    PAPER_SIZE="A4" \
+    PAPER_SIZE="Letter" \
     CONNECTION="ipp" \
     SKIP_HOURS="72" \
     WEBHOOK_URL=""

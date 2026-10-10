@@ -51,7 +51,7 @@ def register_queue(printer):
     subprocess.run(
         ["lpadmin", "-p", name, "-v", printer_uri(printer), "-m", "everywhere",
          "-L", "Network", "-D", printer.get("name", name),
-         "-o", f"media={printer.get('paper_size', 'A4')}",
+         "-o", f"media={printer.get('paper_size', 'Letter')}",
          # Abort a failed job instead of stopping the queue, so it can't block later prints.
          "-o", "printer-error-policy=abort-job"],
         check=True, capture_output=True, text=True, timeout=30)
