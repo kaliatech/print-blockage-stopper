@@ -3,9 +3,7 @@
 #
 # All-in-one container that keeps any IPP-capable network printer's print head
 # healthy by sending a small test print on a schedule. Supports multiple
-# printers, mDNS discovery, custom test images, and a web dashboard.
-#
-# v1.5: Email/HA notifications, print completion monitoring, security fixes
+# printers, custom test images, and a web dashboard.
 ###############################################################################
 
 FROM debian:bookworm-slim
@@ -20,7 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cups-filters \
         cups-ipp-utils \
         printer-driver-gutenprint \
-        avahi-utils \
         cron \
         curl \
         ca-certificates \
@@ -39,6 +36,12 @@ Listen 0.0.0.0:631
 ServerAlias *
 DefaultEncryption Never
 WebInterface Yes
+# Queues point straight at network printers. Nothing is shared or advertised over DNS-SD.
+Browsing No
+# Abort a job that fails instead of stopping the queue. cups_admin.py also sets this per queue.
+ErrorPolicy abort-job
+# Save queue changes to /data/cups right away instead of up to 30s later.
+DirtyCleanInterval 0
 
 # Status pages — read-only, accessible from LAN
 <Location />
@@ -108,6 +111,7 @@ COPY scripts/webui.py /app/webui.py
 COPY scripts/printer_probe.py /app/printer_probe.py
 COPY scripts/stamp_image.py /app/stamp_image.py
 COPY scripts/notify.py /app/notify.py
+COPY scripts/cups_admin.py /app/cups_admin.py
 COPY favicon.ico /app/favicon.ico
 
 RUN chmod +x /app/entrypoint.sh /app/auto-print.sh
@@ -127,6 +131,8 @@ VOLUME ["/data"]
 # CONNECTION:    Default connection type: ipp or socket
 # SKIP_HOURS:    Default skip-if-recently-printed window (hours)
 # WEBHOOK_URL:   (Optional) URL for success/failure notifications
+# TZ:            (Optional) IANA time zone, e.g. America/New_York. Cron schedules,
+#                logs, and the dashboard use it. Defaults to UTC.
 ENV PRINTER_IP="" \
     PRINTER_PORT="9100" \
     SCHEDULE="0 10 */3 * *" \
@@ -141,6 +147,16 @@ EXPOSE 8631
 
 # ── Health check ─────────────────────────────────────────────
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
-    CMD curl -sf http://localhost:8631/ || exit 1
+    CMD curl -sf -o /dev/null http://localhost:8631/ \
+        && lpstat -r | grep -qx 'scheduler is running' \
+        && pgrep -x cron >/dev/null \
+        || exit 1
+
+# ── Version ──────────────────────────────────────────────────
+# Shown in the dashboard footer and startup log. The publish workflow passes
+# `git describe --tags --always --dirty`. Last, so a new version doesn't
+# invalidate the cached layers above.
+ARG VERSION=dev
+ENV APP_VERSION=$VERSION
 
 ENTRYPOINT ["/app/entrypoint.sh"]

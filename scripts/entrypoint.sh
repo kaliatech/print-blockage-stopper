@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 ###############################################################################
-# entrypoint.sh — Service startup, optional legacy printer setup, cron install
+# entrypoint.sh — Configure the container, then run cupsd, cron, and the web UI
 #
-# v1.4: Connection status, ink levels, retry logic, webhooks, CSV export
-#       PRINTER_IP is optional — if set, it auto-adds that printer on first run
-#       for backward compatibility. New users just open the dashboard.
+# PRINTER_IP is optional. If set, that printer is added on first run. Otherwise
+# printers are added from the dashboard.
+#
+# cupsd, cron, and the web UI run as children of this script. If any of them
+# exits, this script exits too, so Docker's restart policy restarts the
+# container instead of leaving it running without a scheduler.
 ###############################################################################
 set -euo pipefail
 
 LOG_DIR="/data/logs"
 mkdir -p "$LOG_DIR" /data/uploads
 
+# ── Time zone ───────────────────────────────────────────────────
+# Cron schedules, log timestamps, and the dashboard all use this zone.
+if [ -n "${TZ:-}" ]; then
+    zone_file="/usr/share/zoneinfo/$TZ"
+    if [ ! -f "$zone_file" ] || [ "$(head -c 4 "$zone_file")" != "TZif" ]; then
+        echo "ENTRYPOINT: ERROR: TZ='$TZ' is not a time zone. Use an IANA name such as America/New_York." >&2
+        exit 1
+    fi
+    ln -sf "$zone_file" /etc/localtime
+    echo "$TZ" > /etc/timezone
+fi
+
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ENTRYPOINT: $*"; }
 
-# ── Input validation (all optional now) ────────────────────────
+# ── Input validation (all optional) ────────────────────────────
 
 PRINTER_IP="${PRINTER_IP:-}"
 PRINTER_PORT="${PRINTER_PORT:-9100}"
@@ -55,6 +70,7 @@ if ! echo "$SKIP_HOURS" | grep -qE '^[0-9]{1,3}$' || [ "$SKIP_HOURS" -lt 1 ] || 
     exit 1
 fi
 
+log "Time zone:        $(cat /etc/timezone 2>/dev/null || echo UTC)"
 log "Default schedule: $SCHEDULE"
 log "Default skip hrs: $SKIP_HOURS"
 log "Paper size:       $PAPER_SIZE"
@@ -63,15 +79,42 @@ log "Paper size:       $PAPER_SIZE"
 PRINTERS_FILE="/data/printers.json"
 if [ ! -f "$PRINTERS_FILE" ]; then
     log "Creating printers.json..."
-    echo "{\"printers\": [], \"global\": {\"schedule\": \"$SCHEDULE\", \"skip_hours\": $SKIP_HOURS, \"webhook_url\": \"$WEBHOOK_URL\"}}" > "$PRINTERS_FILE"
+    PBS_PRINTERS_FILE="$PRINTERS_FILE" PBS_SCHEDULE="$SCHEDULE" PBS_SKIP_HOURS="$SKIP_HOURS" \
+    PBS_WEBHOOK_URL="$WEBHOOK_URL" python3 -c "
+import json, os
+e = os.environ
+data = {'printers': [], 'global': {'schedule': e['PBS_SCHEDULE'], 'skip_hours': int(e['PBS_SKIP_HOURS']),
+                                   'webhook_url': e['PBS_WEBHOOK_URL']}}
+json.dump(data, open(e['PBS_PRINTERS_FILE'], 'w'), indent=2)
+"
 fi
 
-# ── Start CUPS ──────────────────────────────────────────────────
+# ── CUPS state in /data ─────────────────────────────────────────
+# /etc/cups points at /data/cups, so queues (printers.conf and the PPDs generated
+# from each printer) survive container re-creation, even if a printer is off when
+# the container starts. cupsd.conf always comes from the image. This runs before
+# cupsd starts so cupsd loads the saved queues.
+if [ ! -L /etc/cups ]; then
+    [ -d /data/cups ] || cp -a /etc/cups /data/cups
+    cp /etc/cups/cupsd.conf /data/cups/cupsd.conf
+    rm -rf /etc/cups
+    ln -s /data/cups /etc/cups
+fi
+
+# ── Services ────────────────────────────────────────────────────
+declare -A SERVICES
+start_service() {
+    local name="$1"
+    shift
+    "$@" &
+    SERVICES[$!]="$name"
+}
+
 log "Starting CUPS daemon..."
-cupsd
+start_service cupsd cupsd -f
 # Wait for CUPS to be ready (up to 15 seconds)
 for i in $(seq 1 15); do
-    if lpstat -r &>/dev/null; then
+    if lpstat -r 2>/dev/null | grep -qx 'scheduler is running'; then
         log "CUPS ready after ${i}s"
         break
     fi
@@ -81,161 +124,78 @@ for i in $(seq 1 15); do
     fi
 done
 
-# ── Legacy: auto-add PRINTER_IP if set and not already added ────
+# ── Legacy: add PRINTER_IP to printers.json if set and not already added ──
 if [ -n "$PRINTER_IP" ]; then
-    # Validate IP format
     if echo "$PRINTER_IP" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9.\-]{0,253}[a-zA-Z0-9]$'; then
-        # Check if this IP is already in printers.json
-        ALREADY_EXISTS=$(PRINTERS_FILE="$PRINTERS_FILE" CHECK_IP="$PRINTER_IP" python3 -c "
-import json, os
-data = json.load(open(os.environ['PRINTERS_FILE']))
-print(any(p['ip'] == os.environ['CHECK_IP'] for p in data.get('printers', [])))
-" 2>/dev/null) || ALREADY_EXISTS="False"
-
-        if [ "$ALREADY_EXISTS" = "False" ]; then
-            log "Auto-adding printer at $PRINTER_IP (from PRINTER_IP env var)..."
-
-            if [ "$CONNECTION" = "socket" ]; then
-                PRINTER_URI="socket://${PRINTER_IP}:${PRINTER_PORT}"
-            else
-                PRINTER_URI="ipp://${PRINTER_IP}/ipp/print"
-            fi
-
-            CUPS_NAME="PBS_legacy"
-            PRINTER_ID="printer-legacy"
-
-            lpadmin -p "$CUPS_NAME" \
-                -v "$PRINTER_URI" \
-                -m "everywhere" \
-                -L "Network" \
-                -D "Printer at $PRINTER_IP" \
-                -o media="$PAPER_SIZE" 2>/dev/null || true
-
-            cupsaccept "$CUPS_NAME" 2>/dev/null || true
-            cupsenable "$CUPS_NAME" 2>/dev/null || true
-
-            # Add to printers.json
-            PBS_PRINTERS_FILE="$PRINTERS_FILE" \
-            PBS_PRINTER_ID="$PRINTER_ID" \
-            PBS_PRINTER_IP="$PRINTER_IP" \
-            PBS_CONNECTION="$CONNECTION" \
-            PBS_PRINTER_PORT="$PRINTER_PORT" \
-            PBS_PAPER_SIZE="$PAPER_SIZE" \
-            PBS_SCHEDULE="$SCHEDULE" \
-            PBS_SKIP_HOURS="$SKIP_HOURS" \
-            PBS_CUPS_NAME="$CUPS_NAME" \
-            python3 -c "
+        PBS_PRINTERS_FILE="$PRINTERS_FILE" \
+        PBS_PRINTER_IP="$PRINTER_IP" \
+        PBS_CONNECTION="$CONNECTION" \
+        PBS_PRINTER_PORT="$PRINTER_PORT" \
+        PBS_PAPER_SIZE="$PAPER_SIZE" \
+        PBS_SCHEDULE="$SCHEDULE" \
+        PBS_SKIP_HOURS="$SKIP_HOURS" \
+        python3 -c "
 import json, os
 e = os.environ
 data = json.load(open(e['PBS_PRINTERS_FILE']))
-data['printers'].append({
-    'id': e['PBS_PRINTER_ID'],
-    'name': 'Printer at ' + e['PBS_PRINTER_IP'],
-    'ip': e['PBS_PRINTER_IP'],
-    'connection': e['PBS_CONNECTION'],
-    'port': int(e['PBS_PRINTER_PORT']),
-    'paper_size': e['PBS_PAPER_SIZE'],
-    'schedule': e['PBS_SCHEDULE'],
-    'skip_hours': int(e['PBS_SKIP_HOURS']),
-    'paused': False,
-    'test_image': 'preset-11',
-    'cups_name': e['PBS_CUPS_NAME']
-})
-json.dump(data, open(e['PBS_PRINTERS_FILE'], 'w'), indent=2)
-" 2>/dev/null
-
-            log "Printer added: $PRINTER_IP ($CUPS_NAME)"
-        else
-            log "Printer at $PRINTER_IP already configured — skipping auto-add."
-        fi
+if any(p['ip'] == e['PBS_PRINTER_IP'] for p in data.get('printers', [])):
+    print('Printer at ' + e['PBS_PRINTER_IP'] + ' already configured. Skipping auto-add.')
+else:
+    data['printers'].append({
+        'id': 'printer-legacy',
+        'name': 'Printer at ' + e['PBS_PRINTER_IP'],
+        'ip': e['PBS_PRINTER_IP'],
+        'connection': e['PBS_CONNECTION'],
+        'port': int(e['PBS_PRINTER_PORT']),
+        'paper_size': e['PBS_PAPER_SIZE'],
+        'schedule': e['PBS_SCHEDULE'],
+        'skip_hours': int(e['PBS_SKIP_HOURS']),
+        'paused': False,
+        'test_image': 'preset-11',
+        'cups_name': 'PBS_legacy'
+    })
+    json.dump(data, open(e['PBS_PRINTERS_FILE'], 'w'), indent=2)
+    print('Printer added: ' + e['PBS_PRINTER_IP'] + ' (PBS_legacy)')
+" | while read -r line; do log "$line"; done
     else
-        log "WARNING: PRINTER_IP has invalid format: $PRINTER_IP — skipping auto-add."
+        log "WARNING: PRINTER_IP has invalid format: $PRINTER_IP. Skipping auto-add."
     fi
 fi
 
-# ── Symlink CUPS config to /data for persistence ────────────────
-if [ ! -d /data/cups ]; then
-    cp -a /etc/cups /data/cups
-fi
-# Mount persisted CUPS config back so runtime changes survive restarts
-rm -rf /etc/cups
-ln -sf /data/cups /etc/cups
-ln -sf /data/logs /var/log/cups 2>/dev/null || true
+# ── Register printers in CUPS and install cron schedules ──────
+log "Registering printers and installing cron schedules..."
+python3 /app/cups_admin.py sync || log "WARNING: sync failed (see above)"
 
-# ── Re-register all printers in CUPS (from persisted config) ────
-log "Registering printers from config..."
-PBS_PRINTERS_FILE="$PRINTERS_FILE" python3 -c "
-import json, subprocess, os
-data = json.load(open(os.environ['PBS_PRINTERS_FILE']))
-for p in data.get('printers', []):
-    cups_name = p['cups_name']
-    conn = p.get('connection', 'ipp')
-    ip = p['ip']
-    port = p.get('port', 9100)
-    uri = f'socket://{ip}:{port}' if conn == 'socket' else f'ipp://{ip}/ipp/print'
-    paper = p.get('paper_size', 'A4')
-    try:
-        subprocess.run(['lpadmin', '-p', cups_name, '-v', uri, '-m', 'everywhere',
-                        '-L', 'Network', '-D', p.get('name', cups_name),
-                        '-o', f'media={paper}'], check=True, capture_output=True, timeout=15)
-        subprocess.run(['cupsaccept', cups_name], capture_output=True, timeout=5)
-        subprocess.run(['cupsenable', cups_name], capture_output=True, timeout=5)
-        print(f'  Registered: {cups_name} -> {uri}')
-    except Exception as e:
-        print(f'  FAILED: {cups_name} -> {e}')
-" 2>/dev/null || true
-
-# ── Install cron schedules (one line per non-paused printer) ─────
-log "Installing cron schedules..."
-PBS_PRINTERS_FILE="$PRINTERS_FILE" PBS_DEFAULT_SCHEDULE="$SCHEDULE" python3 -c "
-import json, subprocess, os
-data = json.load(open(os.environ['PBS_PRINTERS_FILE']))
-default_sched = os.environ.get('PBS_DEFAULT_SCHEDULE', '0 10 */3 * *')
-lines = []
-for p in data.get('printers', []):
-    if not p.get('paused', False):
-        sched = p.get('schedule', default_sched)
-        pid = p['id']
-        lines.append(f'{sched} . /etc/environment; /app/auto-print.sh --printer-id={pid} >> /data/logs/cron.log 2>&1')
-cron = '\n'.join(lines) + '\n' if lines else ''
-subprocess.run(['crontab', '-'], input=cron.encode(), capture_output=True)
-num = len(lines)
-print(f'  {num} cron job(s) installed')
-" 2>/dev/null || true
-
-# ── Start cron ──────────────────────────────────────────────────
 log "Starting cron daemon..."
-cron
+start_service cron cron -f
 
-# ── Export WEBHOOK_URL from config (for cron jobs) ────────────────
-WEBHOOK_URL_FROM_CONFIG=$(PBS_PRINTERS_FILE="$PRINTERS_FILE" python3 -c "
-import json, os
-data = json.load(open(os.environ['PBS_PRINTERS_FILE']))
-print(data.get('global', {}).get('webhook_url', ''))
-" 2>/dev/null) || WEBHOOK_URL_FROM_CONFIG=""
-
-# Prefer config file value, fall back to env var
-export WEBHOOK_URL="${WEBHOOK_URL_FROM_CONFIG:-$WEBHOOK_URL}"
-
-# Write to /etc/environment so cron jobs inherit it
-echo "WEBHOOK_URL=\"$WEBHOOK_URL\"" >> /etc/environment
-
-# ── Start web UI ────────────────────────────────────────────────
 log "Starting web UI on port 8631..."
-python3 /app/webui.py &
+start_service webui python3 /app/webui.py
 
-# ── Count printers ──────────────────────────────────────────────
+# Copy the print log and CUPS errors to the container log.
+touch /data/logs/auto-print.log
+start_service log-tail tail -n 0 -F /data/logs/auto-print.log /var/log/cups/error_log 2>/dev/null
+
 NUM_PRINTERS=$(PBS_PRINTERS_FILE="$PRINTERS_FILE" python3 -c "import json, os; print(len(json.load(open(os.environ['PBS_PRINTERS_FILE'])).get('printers',[])))" 2>/dev/null) || NUM_PRINTERS=0
 
 log "============================================================"
-log " print-blockage-stopper v1.5.1 is running"
+log " print-blockage-stopper ${APP_VERSION:-unknown} is running"
 log " Dashboard:  http://localhost:8631"
-log " CUPS UI:    http://localhost:631"
 log " Printers:   $NUM_PRINTERS configured"
 log " Logs:       /data/logs/"
 log "============================================================"
 
-# ── Keep container alive ────────────────────────────────────────
-touch /data/logs/cron.log
-exec tail -f /data/logs/cron.log /var/log/cups/error_log 2>/dev/null || \
-    exec tail -f /dev/null
+# ── Run until a service exits ───────────────────────────────────
+# The container ends as soon as this script exits, so wait for the services to
+# stop. That gives cupsd time to save queue state.
+stop_services() {
+    kill "${!SERVICES[@]}" 2>/dev/null
+    wait
+}
+trap 'log "Stopping"; stop_services; exit 0' TERM INT
+set +e
+wait -n -p EXITED_PID
+status=$?
+log "ERROR: ${SERVICES[$EXITED_PID]:-a service} exited with status $status. Exiting so Docker restarts the container."
+stop_services
+exit 1

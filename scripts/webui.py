@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Web UI for print-blockage-stopper v1.4.
+Web UI for print-blockage-stopper.
 Full-featured dashboard with:
   - Multi-printer management (add/remove/rename)
-  - Network discovery (mDNS/IPP)
   - Per-printer status, schedule, skip-hours, pause/resume
   - Test connection / auto-detect model via IPP
   - Connection status indicators (periodic ping)
@@ -30,6 +29,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from cups_admin import install_cron, register_queue
+
 PORT = 8631
 DATA_DIR = "/data"
 PRINTERS_FILE = f"{DATA_DIR}/printers.json"
@@ -39,6 +40,19 @@ UPLOADS_DIR = f"{DATA_DIR}/uploads"
 PRESETS_DIR = "/app/presets"
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 THUMBS_DIR = f"{DATA_DIR}/thumbnails"
+# Set at build time from `git describe` (see Dockerfile).
+APP_VERSION = os.environ.get("APP_VERSION", "unknown")
+
+def _configured_tz():
+    """The container's time zone name, e.g. America/New_York. Cron uses the same zone."""
+    if os.environ.get("TZ"):
+        return os.environ["TZ"]
+    try:
+        return Path("/etc/timezone").read_text().strip() or "UTC"
+    except OSError:
+        return "UTC"
+
+TZ_NAME = _configured_tz()
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
@@ -79,23 +93,11 @@ def sanitise_cups_name(name):
 # ── CUPS management ─────────────────────────────────────────────
 
 def add_cups_printer(printer):
-    cups_name = printer["cups_name"]
-    conn = printer.get("connection", "ipp")
-    ip = printer["ip"]
-    port = printer.get("port", 9100)
-    uri = f"socket://{ip}:{port}" if conn == "socket" else f"ipp://{ip}/ipp/print"
-    paper = printer.get("paper_size", "A4")
     try:
-        subprocess.run(
-            ["lpadmin", "-p", cups_name, "-v", uri, "-m", "everywhere",
-             "-L", "Network", "-D", printer.get("name", cups_name),
-             "-o", f"media={paper}"],
-            check=True, capture_output=True, timeout=15)
-        subprocess.run(["cupsaccept", cups_name], capture_output=True, timeout=5)
-        subprocess.run(["cupsenable", cups_name], capture_output=True, timeout=5)
+        register_queue(printer)
         return True
     except Exception as e:
-        print(f"Error adding CUPS printer {cups_name}: {e}")
+        print(f"Error adding CUPS printer {printer['cups_name']}: {e}")
         return False
 
 def remove_cups_printer(cups_name):
@@ -115,42 +117,6 @@ def probe_printer(ip, connection="ipp", port=9100):
         return json.loads(result.stdout)
     except Exception as e:
         return {"reachable": False, "model": None, "ink_levels": [], "error": str(e)}
-
-# ── mDNS / IPP discovery ───────────────────────────────────────
-
-def discover_printers():
-    found = []
-    try:
-        result = subprocess.run(
-            ["avahi-browse", "-t", "-r", "-p", "_ipp._tcp"],
-            capture_output=True, text=True, timeout=10)
-        for line in result.stdout.splitlines():
-            parts = line.split(";")
-            if len(parts) < 10 or parts[0] != "=":
-                continue
-            name = parts[3].replace("\\032", " ")
-            ip = parts[7]
-            port = parts[8]
-            if ":" in ip and ip.startswith("fe80"):
-                continue
-            if ip and not any(f["ip"] == ip for f in found):
-                found.append({"name": name, "ip": ip, "port": int(port) if port.isdigit() else 631})
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    if not found:
-        try:
-            result = subprocess.run(
-                ["ippfind", "--timeout", "5"],
-                capture_output=True, text=True, timeout=10)
-            for line in result.stdout.strip().splitlines():
-                m = re.match(r'ipp://([^:/]+)', line)
-                if m:
-                    ip = m.group(1)
-                    if not any(f["ip"] == ip for f in found):
-                        found.append({"name": f"Printer at {ip}", "ip": ip, "port": 631})
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-    return found
 
 # ── Print helpers ───────────────────────────────────────────────
 
@@ -305,15 +271,10 @@ def cron_next(cron_expr):
 # ── Cron management ─────────────────────────────────────────────
 
 def update_cron():
-    data = read_printers()
-    lines = []
-    for p in data["printers"]:
-        if not p.get("paused", False):
-            schedule = p.get("schedule", data["global"]["schedule"])
-            lines.append(f'{schedule} . /etc/environment; /app/auto-print.sh --printer-id={p["id"]} >> /data/logs/cron.log 2>&1')
-    cron_content = "\n".join(lines) + "\n" if lines else ""
-    subprocess.run(["crontab", "-"], input=cron_content.encode(),
-                   capture_output=True, timeout=5)
+    try:
+        install_cron(read_printers())
+    except Exception as e:
+        print(f"Error installing crontab: {e}")
 
 # ── HTTP Handler ────────────────────────────────────────────────
 
@@ -339,8 +300,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_dashboard()
         elif self.path == "/api/printers":
             self._json_response(redact_secrets(read_printers()))
-        elif self.path == "/api/discover":
-            self._json_response({"printers": discover_printers()})
         elif self.path == "/api/history":
             self._json_response({"history": get_history()})
         elif self.path == "/api/history.csv":
@@ -364,7 +323,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     sched = printer.get("schedule", data["global"]["schedule"])
                     nxt = cron_next(sched)
                     self._json_response({
-                        "next_iso": nxt.isoformat() if nxt else None,
+                        # With the UTC offset, so the browser reads it as the configured zone's time.
+                        "next_iso": nxt.astimezone().isoformat() if nxt else None,
                         "paused": False
                     })
             else:
@@ -516,6 +476,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "cups_name": cups_name,
         }
         if not add_cups_printer(printer):
+            # CUPS creates the queue even when the printer doesn't answer. Don't leave it behind.
+            remove_cups_printer(cups_name)
             self._json_response({"ok": False, "message": "Failed to add printer to CUPS. Check the IP."}, 500)
             return
         data["printers"].append(printer)
@@ -618,17 +580,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except ValueError:
                     pass  # hostname is not an IP — that's fine
             data.setdefault("global", {})["webhook_url"] = url
-            # Also set env var for auto-print.sh and update /etc/environment for cron
-            url = body["webhook_url"].strip()
-            os.environ["WEBHOOK_URL"] = url
-            try:
-                with open("/etc/environment", "r") as f:
-                    lines = [l for l in f.readlines() if not l.startswith("WEBHOOK_URL=")]
-                with open("/etc/environment", "w") as f:
-                    f.writelines(lines)
-                    f.write(f'WEBHOOK_URL="{url}"\n')
-            except Exception:
-                pass
         write_printers(data)
         self._json_response({"ok": True})
 
@@ -959,6 +910,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             <select class="input-sm select-sm" id="hour-{p["id"]}"
                     onchange="updateSchedule('{p["id"]}')" style="max-width:100px;">
             </select>
+            <span class="meta">{html_mod.escape(TZ_NAME)}</span>
             <span class="schedule-state" style="color:{sched_colour}">{sched_state}</span>
             <button class="btn btn-sm" style="background:{pause_colour}" onclick="toggleSchedule('{p["id"]}')">{pause_label}</button>
           </div>
@@ -970,7 +922,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             </select>
           </div>
           <div class="control-group">
-            <label>Skip if active within:</label>
+            <label title="Counts prints sent by this service. The printer doesn't report other jobs.">Skip if printed within:</label>
             <input type="number" class="input-sm" value="{p.get("skip_hours", 72)}" min="1" max="720"
                    id="skip-{p["id"]}" onchange="updatePrinter('{p["id"]}', {{skip_hours: parseInt(this.value)}})">
             <span class="meta">hours</span>
@@ -1096,11 +1048,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
   .add-form input:focus, .add-form select:focus {{ border-color: #3b82f6; outline: none; box-shadow: 0 0 0 2px rgba(59,130,246,0.15); }}
   @media (max-width: 600px) {{ .add-form {{ grid-template-columns: 1fr; }} }}
 
-  .discover-list {{ display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }}
-  .discover-item {{ display: flex; justify-content: space-between; align-items: center;
-                     background: #0f172a; padding: 10px 14px; border-radius: 8px; transition: background 0.15s; }}
-  .discover-item:hover {{ background: #162032; }}
-
   .empty-state {{ text-align: center; color: #64748b; padding: 30px 20px; font-size: 0.9rem; }}
 
   /* Chart with tooltips */
@@ -1188,12 +1135,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
   <!-- Add Printer -->
   <div class="card">
     <h2>Add Printer</h2>
-    <div class="btn-row" style="margin-bottom:10px;">
-      <button class="btn btn-sm" style="background:#6366f1;display:inline-flex;align-items:center;gap:5px;" onclick="discoverPrinters()" id="discoverBtn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>Discover on Network</button>
-      <span class="btn-msg" id="discoverMsg"></span>
-    </div>
-    <div id="discoverResults"></div>
-    <div class="section-divider"></div>
     <div class="add-form" id="addForm">
       <div>
         <label for="addName">Name</label>
@@ -1231,7 +1172,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         </select>
       </div>
       <div>
-        <label for="addHour">At</label>
+        <label for="addHour">At ({html_mod.escape(TZ_NAME)})</label>
         <select id="addHour"></select>
       </div>
       <div class="full">
@@ -1362,16 +1303,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
     <pre id="logs">{escaped_logs}</pre>
   </div>
 
-  <div class="card" style="padding: 12px 16px;">
-    <a href="/printers" target="_blank">CUPS Printer Status (port 631)</a>
-  </div>
-
-  <div class="footer">print-blockage-stopper v1.5.1</div>
+  <div class="footer">print-blockage-stopper {html_mod.escape(APP_VERSION)} · {html_mod.escape(TZ_NAME)}</div>
 </div>
 <div class="toast-container" id="toastContainer"></div>
 
 <script>
 const historyData = {history_json};
+
+// Times are shown in the server's time zone, the one cron uses.
+const SERVER_TZ = {json.dumps(TZ_NAME)};
+function tzFormat(locale, opts) {{
+  try {{ return new Intl.DateTimeFormat(locale, Object.assign({{ timeZone: SERVER_TZ }}, opts)); }}
+  catch (e) {{ return new Intl.DateTimeFormat(locale, opts); }}
+}}
+const dayKeyFormat = tzFormat('en-CA', {{ year: 'numeric', month: '2-digit', day: '2-digit' }});
+const nextDateFormat = tzFormat('en-US', {{ month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }});
 
 function esc(s) {{ if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }}
 
@@ -1563,33 +1509,6 @@ function addPrinter() {{
   }}).catch(() => {{ btn.disabled = false; showToast('Network error', 'error'); }});
 }}
 
-// ── Discovery ───────────────────────────────────────────
-function discoverPrinters() {{
-  const btn = document.getElementById('discoverBtn');
-  const container = document.getElementById('discoverResults');
-  btn.disabled = true; btn.textContent = 'Scanning...';
-  api('/api/discover', 'GET').then(d => {{
-    btn.disabled = false; btn.textContent = 'Discover on Network';
-    if (!d.printers || !d.printers.length) {{
-      showToast('No printers found. Try adding manually.', '');
-      container.innerHTML = ''; return;
-    }}
-    let h = '<div class="discover-list">';
-    d.printers.forEach(p => {{
-      h += `<div class="discover-item">
-        <div><strong>${{esc(p.name)}}</strong> <span class="meta">${{esc(p.ip)}}</span></div>
-        <button class="btn btn-primary btn-sm" onclick="quickAdd('${{p.ip.replace(/'/g, "\\\\'")}}',' ${{p.name.replace(/'/g, "\\\\'")}}')">Add</button>
-      </div>`;
-    }});
-    container.innerHTML = h + '</div>';
-  }}).catch(() => {{ btn.disabled = false; btn.textContent = 'Discover on Network'; }});
-}}
-function quickAdd(ip, name) {{
-  document.getElementById('addIp').value = ip;
-  document.getElementById('addName').value = name;
-  addPrinter();
-}}
-
 // ── Image upload ────────────────────────────────────────
 function uploadImage() {{
   const input = document.getElementById('uploadFile');
@@ -1735,7 +1654,8 @@ function renderChart() {{
   const byDate = {{}};
   historyData.forEach(e => {{ const d = e.timestamp.split(' ')[0]; if (!byDate[d]) byDate[d] = []; byDate[d].push(e); }});
   const days = []; const now = new Date();
-  for (let i = 29; i >= 0; i--) {{ const d = new Date(now); d.setDate(d.getDate()-i); days.push({{ date: d.toISOString().split('T')[0], entries: byDate[d.toISOString().split('T')[0]] || [] }}); }}
+  // History timestamps are in the server's zone, so group days in that zone too.
+  for (let i = 29; i >= 0; i--) {{ const key = dayKeyFormat.format(new Date(now.getTime() - i * 86400000)); days.push({{ date: key, entries: byDate[key] || [] }}); }}
   container.innerHTML = '';
   days.forEach(day => {{
     const bar = document.createElement('div'); bar.className = 'chart-bar';
@@ -1795,13 +1715,7 @@ function formatCountdown(ms) {{
 }}
 
 function formatNextDate(iso) {{
-  const d = new Date(iso);
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const h = d.getHours();
-  const ampm = h >= 12 ? 'PM' : 'AM';
-  const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
-  const min = String(d.getMinutes()).padStart(2, '0');
-  return `${{months[d.getMonth()]}} ${{d.getDate()}}, ${{h12}}:${{min}} ${{ampm}}`;
+  return nextDateFormat.format(new Date(iso));
 }}
 
 function refreshNextPrint() {{

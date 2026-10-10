@@ -1,8 +1,18 @@
-# Builds the image locally. Run `docker compose up -d --build`, then open http://localhost:8631.
+# Builds the image locally, with the version shown in the dashboard footer:
+#   VERSION=$(git describe --tags --always --dirty) docker compose up -d --build
+# then open http://localhost:8631.
 # Port 631 (CUPS) stays unpublished. The dashboard and print jobs reach CUPS inside the container.
 services:
   print-blockage-stopper:
-    build: .
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    # tini as PID 1 forwards stop signals and reaps orphaned processes.
+    init: true
+    environment:
+      # IANA zone name. Print times in the dashboard and cron schedules are in this zone.
+      TZ: America/New_York
     ports:
       - "8631:8631"
     volumes:
