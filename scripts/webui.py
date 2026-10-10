@@ -16,6 +16,7 @@ Full-featured dashboard with:
 """
 
 import base64
+import copy
 import csv
 import fcntl
 import http.server
@@ -60,6 +61,16 @@ def write_printers(data):
             json.dump(data, f, indent=2)
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+
+def redact_secrets(data):
+    """Return a copy of the config with stored passwords and tokens replaced by
+    the "***" sentinel. The save handlers keep the stored value when they get it back."""
+    data = copy.deepcopy(data)
+    g = data.get("global", {})
+    for section, field in (("email", "smtp_password"), ("homeassistant", "ha_token")):
+        if g.get(section, {}).get(field):
+            g[section][field] = "***"
+    return data
 
 def sanitise_cups_name(name):
     s = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
@@ -327,7 +338,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/":
             self._serve_dashboard()
         elif self.path == "/api/printers":
-            self._json_response(read_printers())
+            self._json_response(redact_secrets(read_printers()))
         elif self.path == "/api/discover":
             self._json_response({"printers": discover_printers()})
         elif self.path == "/api/history":
