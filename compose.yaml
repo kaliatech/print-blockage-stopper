@@ -1,0 +1,15 @@
+# Builds the image locally. Run `docker compose up -d --build`, then open http://localhost:8631.
+# Port 631 (CUPS) stays unpublished. The dashboard and print jobs reach CUPS inside the container.
+services:
+  print-blockage-stopper:
+    build: .
+    ports:
+      - "8631:8631"
+    volumes:
+      - ./data:/data
+    # Same restrictions as the upstream Unraid template.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

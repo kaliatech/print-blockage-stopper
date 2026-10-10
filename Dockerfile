@@ -10,9 +10,8 @@
 
 FROM debian:bookworm-slim
 
-LABEL maintainer="ahmed@abadr.net"
+# The publish workflow adds org.opencontainers.image.* labels (source, revision, version).
 LABEL description="Automated maintenance prints for any network printer (IPP Everywhere compatible)"
-LABEL org.opencontainers.image.source="https://github.com/ahmedbadr3/print-blockage-stopper"
 
 # ── Install packages ─────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
