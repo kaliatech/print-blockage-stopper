@@ -31,18 +31,27 @@ Presets:
   8-colour:  CMYK + LC + LM + Light Black + Light Light Black
   11-colour: CMYK + LC + LM + LK + LLK + Red + Blue + Matte Black
   12-colour: CMYK + LC + LM + LK + LLK + Red + Blue + Green + Matte Black
+
+The layout is in units of about one point. Its 600-unit width fills the
+printable width (8.27 in on Letter, so one unit is 0.99 pt there).
+render_preset() draws it at any pixel width. compose_page.py calls it at the
+printer's resolution, so lines and text are drawn at full resolution instead of
+being scaled up. Running this file writes 300 dpi PNGs for the dashboard's
+thumbnails and download links.
+
+Usage: presets.py [OUTPUT_DIR]
 """
 
 from PIL import Image, ImageDraw, ImageFont
 import os
 import sys
 
-OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "/app/presets"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Keep image compact — roughly half a page at 150 DPI
+# Layout size in units
 WIDTH = 600
 MARGIN = 14
+# Resolution of the PNGs written by main()
+PNG_DPI = 300
+FONT_DIR = "/usr/share/fonts/truetype/dejavu"
 
 # Ink channel colours (RGB approximations that force specific ink channels)
 CHANNELS = {
@@ -58,6 +67,13 @@ CHANNELS = {
     "Blue":           (0, 68, 181),
     "Green":          (0, 148, 68),
     "Matte Black":    (60, 55, 50),
+}
+
+ABBREVS = {
+    "Cyan": "C", "Magenta": "M", "Yellow": "Y", "Black": "K",
+    "Light Cyan": "LC", "Light Magenta": "LM",
+    "Light Black": "LK", "Light Lt Black": "LLK",
+    "Red": "R", "Blue": "B", "Green": "G", "Matte Black": "MK",
 }
 
 PRESETS = {
@@ -92,54 +108,79 @@ def stagger_order(channels):
     return evens + odds
 
 
-def draw_nozzle_check(draw, x, y, w, channels, font):
+class Canvas:
+    """Draws on a Pillow image with coordinates in layout units."""
+
+    def __init__(self, img, scale):
+        self.draw = ImageDraw.Draw(img)
+        self.scale = scale  # pixels per unit
+
+    def px(self, v):
+        return round(v * self.scale)
+
+    def font(self, filename, size):
+        try:
+            return ImageFont.truetype(os.path.join(FONT_DIR, filename), self.px(size))
+        except OSError:
+            return ImageFont.load_default()
+
+    def text(self, x, y, text, fill, font):
+        self.draw.text((self.px(x), self.px(y)), text, fill=fill, font=font)
+
+    def box(self, x0, y0, x1, y1, fill):
+        """Fill from (x0, y0) to (x1, y1) inclusive, like ImageDraw.rectangle in units."""
+        self.draw.rectangle([self.px(x0), self.px(y0), self.px(x1 + 1) - 1, self.px(y1 + 1) - 1],
+                            fill=fill)
+
+    def hline(self, x0, x1, y, fill):
+        """A one-unit horizontal line from x0 to x1 inclusive, the same thickness everywhere."""
+        top = self.px(y)
+        self.draw.rectangle([self.px(x0), top, self.px(x1 + 1) - 1, top + max(1, round(self.scale)) - 1],
+                            fill=fill)
+
+    def gradient(self, x, y, w, h, c1, c2):
+        """Fill w x h units at (x, y) with a left-to-right blend from c1 to c2."""
+        x0, x1 = self.px(x), self.px(x + w)
+        y0, y1 = self.px(y), self.px(y + h) - 1
+        for col in range(x0, x1):
+            t = (col - x0) / max(x1 - x0 - 1, 1)
+            self.draw.line([(col, y0), (col, y1)], fill=blend(c1, c2, t))
+
+
+def draw_nozzle_check(c, x, y, w, channels, font):
     """Draw fine staggered horizontal lines per channel — nozzle check style.
-    Each channel gets 4 thin lines (1px) with 2px gaps, staggered by 1px."""
+    Each channel gets 4 thin lines (1 unit) with 2-unit gaps, staggered by 1 unit."""
     section_y = y
     label_w = 18  # short label like "C", "M", etc.
     line_x = x + label_w + 4
     line_w = w - label_w - 4
     num_lines = 4
-    line_spacing = 3  # 1px line + 2px gap
-
-    abbrevs = {
-        "Cyan": "C", "Magenta": "M", "Yellow": "Y", "Black": "K",
-        "Light Cyan": "LC", "Light Magenta": "LM",
-        "Light Black": "LK", "Light Lt Black": "LLK",
-        "Red": "R", "Blue": "B", "Green": "G", "Matte Black": "MK",
-    }
+    line_spacing = 3  # 1-unit line + 2-unit gap
 
     for i, ch_name in enumerate(channels):
         colour = CHANNELS[ch_name]
-        abbr = abbrevs.get(ch_name, ch_name[:2])
-        stagger = i % 3  # offset lines by 0-2 px to test different nozzles
+        abbr = ABBREVS.get(ch_name, ch_name[:2])
+        stagger = i % 3  # offset lines by 0-2 units to test different nozzles
 
-        draw.text((x, section_y), abbr, fill=colour, font=font)
+        c.text(x, section_y, abbr, colour, font)
         for line_num in range(num_lines):
             ly = section_y + stagger + line_num * line_spacing
-            draw.line([(line_x, ly), (line_x + line_w, ly)], fill=colour, width=1)
+            c.hline(line_x, line_x + line_w, ly, colour)
 
         section_y += num_lines * line_spacing + 4
 
     return section_y - y
 
 
-def draw_colour_patches(draw, x, y, w, channels, font):
+def draw_colour_patches(c, x, y, w, channels, font):
     """Draw tiny colour patches — pure + light shade in a compact 3-column grid.
-    Each patch is just 6px tall to minimise ink."""
+    Each patch is just 6 units tall to minimise ink."""
     patch_h = 6
     row_gap = 2
     cols = 3
     col_w = (w - (cols - 1) * 4) // cols
     patch_w = col_w - 30  # room for short label
     section_y = y
-
-    abbrevs = {
-        "Cyan": "C", "Magenta": "M", "Yellow": "Y", "Black": "K",
-        "Light Cyan": "LC", "Light Magenta": "LM",
-        "Light Black": "LK", "Light Lt Black": "LLK",
-        "Red": "R", "Blue": "B", "Green": "G", "Matte Black": "MK",
-    }
 
     for i in range(0, len(channels), cols):
         for col in range(cols):
@@ -151,25 +192,22 @@ def draw_colour_patches(draw, x, y, w, channels, font):
             light = lighten(colour)
             cx = x + col * (col_w + 4)
 
-            abbr = abbrevs.get(ch_name, ch_name[:2])
-            draw.text((cx, section_y), abbr, fill=(100, 100, 100), font=font)
+            abbr = ABBREVS.get(ch_name, ch_name[:2])
+            c.text(cx, section_y, abbr, (100, 100, 100), font)
 
             px = cx + 30
             half = patch_w // 2
-            draw.rectangle([(px, section_y), (px + half - 1, section_y + patch_h)],
-                           fill=colour)
-            draw.rectangle([(px + half + 1, section_y),
-                            (px + patch_w, section_y + patch_h)],
-                           fill=light)
+            c.box(px, section_y, px + half - 1, section_y + patch_h, colour)
+            c.box(px + half + 1, section_y, px + patch_w, section_y + patch_h, light)
 
         section_y += patch_h + row_gap
 
     return section_y - y
 
 
-def draw_blend_strips(draw, x, y, w, channels):
+def draw_blend_strips(c, x, y, w, channels):
     """Draw thin horizontal gradient strips blending adjacent channels.
-    Each strip is 2px tall — just enough to fire both channels at varying ratios."""
+    Each strip is 2 units tall — just enough to fire both channels at varying ratios."""
     strip_h = 2
     strip_gap = 2
     section_y = y
@@ -183,36 +221,21 @@ def draw_blend_strips(draw, x, y, w, channels):
         pairs.append((channels[-1], channels[0]))
 
     for ch1_name, ch2_name in pairs:
-        c1 = CHANNELS[ch1_name]
-        c2 = CHANNELS[ch2_name]
-        for px_x in range(w):
-            t = px_x / max(w - 1, 1)
-            c = blend(c1, c2, t)
-            draw.line([(x + px_x, section_y), (x + px_x, section_y + strip_h - 1)], fill=c)
+        c.gradient(x, section_y, w, strip_h, CHANNELS[ch1_name], CHANNELS[ch2_name])
         section_y += strip_h + strip_gap
 
     return section_y - y
 
 
-def generate_preset(name, channel_names):
+def render_preset(name, width_px):
+    """Draw preset `name` (a key of PRESETS) width_px pixels wide and return the image."""
+    channel_names = PRESETS[name]
     # Stagger the channel order for nozzle check section
     staggered = stagger_order(channel_names)
 
-    try:
-        font_title = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-        font_section = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 10)
-        font_sm = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
-        font_tiny = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 8)
-    except OSError:
-        font_title = font_section = font_sm = font_tiny = ImageFont.load_default()
-
     # Calculate heights for each section
     n = len(channel_names)
-    nozzle_h = n * (4 * 3 + 4)  # 4 lines * 3px spacing + 4px gap per channel
+    nozzle_h = n * (4 * 3 + 4)  # 4 lines * 3-unit spacing + 4-unit gap per channel
     patch_rows = (n + 2) // 3   # 3 columns now
     patch_h = patch_rows * (6 + 2)
     blend_pairs = n  # n-1 adjacent + 1 wraparound (or n-1 if <=2)
@@ -226,49 +249,56 @@ def generate_preset(name, channel_names):
                + section_label_h + blend_h + 6
                + 20 + MARGIN)
 
-    img = Image.new("RGB", (WIDTH, total_h), (255, 255, 255))
-    draw = ImageDraw.Draw(img)
+    scale = width_px / WIDTH
+    img = Image.new("RGB", (width_px, round(total_h * scale)), (255, 255, 255))
+    c = Canvas(img, scale)
+    font_title = c.font("DejaVuSans-Bold.ttf", 14)
+    font_section = c.font("DejaVuSans-Bold.ttf", 10)
+    font_tiny = c.font("DejaVuSans.ttf", 8)
 
     content_w = WIDTH - 2 * MARGIN
     y = MARGIN
 
     # Title
-    title = f"Maintenance Print — {name}-Colour"
-    draw.text((MARGIN, y), title, fill=(35, 31, 32), font=font_title)
+    c.text(MARGIN, y, f"Maintenance Print — {name}-Colour", (35, 31, 32), font_title)
     y += title_h
 
     # Section 1: Nozzle Check Lines
-    draw.text((MARGIN, y), "NOZZLE CHECK", fill=(120, 120, 120), font=font_section)
+    c.text(MARGIN, y, "NOZZLE CHECK", (120, 120, 120), font_section)
     y += section_label_h
-    h = draw_nozzle_check(draw, MARGIN, y, content_w, staggered, font_tiny)
+    h = draw_nozzle_check(c, MARGIN, y, content_w, staggered, font_tiny)
     y += h + 6
 
     # Section 2: Colour Patches (pure + light)
-    draw.text((MARGIN, y), "COLOUR PATCHES", fill=(120, 120, 120), font=font_section)
+    c.text(MARGIN, y, "COLOUR PATCHES", (120, 120, 120), font_section)
     y += section_label_h
-    h = draw_colour_patches(draw, MARGIN, y, content_w, channel_names, font_tiny)
+    h = draw_colour_patches(c, MARGIN, y, content_w, channel_names, font_tiny)
     y += h + 6
 
     # Section 3: Blend Strips
-    draw.text((MARGIN, y), "CHANNEL BLENDS", fill=(120, 120, 120), font=font_section)
+    c.text(MARGIN, y, "CHANNEL BLENDS", (120, 120, 120), font_section)
     y += section_label_h
-    h = draw_blend_strips(draw, MARGIN, y, content_w, channel_names)
+    h = draw_blend_strips(c, MARGIN, y, content_w, channel_names)
     y += h + 6
 
     # Footer
-    draw.text(
-        (MARGIN, total_h - MARGIN - 10),
-        "print-blockage-stopper — low-ink maintenance print",
-        fill=(180, 180, 180),
-        font=font_tiny
-    )
+    c.text(MARGIN, total_h - MARGIN - 10, "print-blockage-stopper — low-ink maintenance print",
+           (180, 180, 180), font_tiny)
 
-    out_path = os.path.join(OUTPUT_DIR, f"preset-{name}.png")
-    img.save(out_path, "PNG", optimize=True)
-    print(f"Generated {out_path} ({img.size[0]}x{img.size[1]})")
+    return img
+
+
+def main():
+    output_dir = sys.argv[1] if len(sys.argv) > 1 else "/app/presets"
+    os.makedirs(output_dir, exist_ok=True)
+    width_px = round(WIDTH / 72 * PNG_DPI)
+    for name in PRESETS:
+        img = render_preset(name, width_px)
+        out_path = os.path.join(output_dir, f"preset-{name}.png")
+        img.save(out_path, "PNG", optimize=True, dpi=(PNG_DPI, PNG_DPI))
+        print(f"Generated {out_path} ({img.size[0]}x{img.size[1]})")
+    print(f"All presets generated in {output_dir}")
 
 
 if __name__ == "__main__":
-    for name, channels in PRESETS.items():
-        generate_preset(name, channels)
-    print(f"All presets generated in {OUTPUT_DIR}")
+    main()

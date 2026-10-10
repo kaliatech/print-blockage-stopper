@@ -104,12 +104,12 @@ RUN mkdir -p /app /app/presets /data/logs /data/uploads
 
 # ── Copy application files ───────────────────────────────────
 COPY test-image/pro1100-test-print.png /app/test-print.png
-COPY scripts/generate-presets.py /app/generate-presets.py
+COPY scripts/presets.py /app/presets.py
 COPY scripts/entrypoint.sh /app/entrypoint.sh
 COPY scripts/auto-print.sh /app/auto-print.sh
 COPY scripts/webui.py /app/webui.py
 COPY scripts/printer_probe.py /app/printer_probe.py
-COPY scripts/stamp_image.py /app/stamp_image.py
+COPY scripts/compose_page.py /app/compose_page.py
 COPY scripts/notify.py /app/notify.py
 COPY scripts/cups_admin.py /app/cups_admin.py
 COPY favicon.ico /app/favicon.ico
@@ -117,7 +117,7 @@ COPY favicon.ico /app/favicon.ico
 RUN chmod +x /app/entrypoint.sh /app/auto-print.sh
 
 # ── Generate preset test images at build time ─────────────────
-RUN python3 /app/generate-presets.py /app/presets
+RUN python3 /app/presets.py /app/presets
 
 # ── Volumes ──────────────────────────────────────────────────
 # /data persists logs, printer config, uploads, and CUPS state

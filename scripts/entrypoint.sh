@@ -151,7 +151,7 @@ else:
         'schedule': e['PBS_SCHEDULE'],
         'skip_hours': int(e['PBS_SKIP_HOURS']),
         'paused': False,
-        'test_image': 'preset-11',
+        'test_image': 'preset-4',
         'cups_name': 'PBS_legacy'
     })
     json.dump(data, open(e['PBS_PRINTERS_FILE'], 'w'), indent=2)

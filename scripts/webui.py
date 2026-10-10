@@ -121,7 +121,7 @@ def probe_printer(ip, connection="ipp", port=9100):
 # ── Print helpers ───────────────────────────────────────────────
 
 def get_test_image_path(printer):
-    img = printer.get("test_image", "preset-11")
+    img = printer.get("test_image", "preset-4")
     if img.startswith("preset-"):
         path = f"{PRESETS_DIR}/{img}.png"
         if os.path.exists(path):
@@ -132,7 +132,7 @@ def get_test_image_path(printer):
             return path
     if os.path.exists("/app/test-print.png"):
         return "/app/test-print.png"
-    return f"{PRESETS_DIR}/preset-11.png"
+    return f"{PRESETS_DIR}/preset-4.png"
 
 def trigger_print(printer_id):
     subprocess.Popen(
@@ -472,7 +472,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "schedule": body.get("schedule", data["global"]["schedule"]),
             "skip_hours": max(1, min(8760, int(body.get("skip_hours", data["global"]["skip_hours"])))),
             "paused": False,
-            "test_image": body.get("test_image", "preset-11"),
+            "test_image": body.get("test_image", "preset-4"),
+            "vary_position": bool(body.get("vary_position", False)),
             "cups_name": cups_name,
         }
         if not add_cups_printer(printer):
@@ -524,7 +525,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if printer.get(key) != body[key]:
                     changed_cups = True
                 printer[key] = body[key]
-        for key in ["schedule", "skip_hours", "paused", "test_image"]:
+        for key in ["schedule", "skip_hours", "paused", "test_image", "vary_position"]:
             if key in body:
                 printer[key] = body[key]
         if changed_cups:
@@ -813,7 +814,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data = read_printers()
         for p in data["printers"]:
             if p.get("test_image") == image_id:
-                p["test_image"] = "preset-11"
+                p["test_image"] = "preset-4"
         write_printers(data)
         self._json_response({"ok": True, "message": f"Deleted {filename}"})
 
@@ -861,7 +862,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pause_colour = "#22c55e" if paused else "#f59e0b"
                 sched_state = "PAUSED" if paused else "Active"
                 sched_colour = "#ef4444" if paused else "#22c55e"
-                test_img = p.get("test_image", "preset-11")
+                test_img = p.get("test_image", "preset-4")
                 cur_sched = p.get("schedule", "0 10 */3 * *")
                 thumb = get_image_thumbnail_b64(p)
 
@@ -935,6 +936,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             </select>
             {thumb_html}
             <a href="/api/download-image/{p["id"]}" class="btn btn-sm" style="padding:2px 8px;font-size:0.75rem;text-decoration:none;display:inline-flex;align-items:center;gap:4px;" title="Download test image"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>Download</a>
+          </div>
+          <div class="control-group">
+            <label for="vary-{p["id"]}" title="Prints the pattern at a random height each time, so its thin lines land on different nozzles.">Vary vertical position:</label>
+            <input type="checkbox" id="vary-{p["id"]}" {"checked" if p.get("vary_position") else ""}
+                   onchange="updatePrinter('{p["id"]}', {{vary_position: this.checked}})">
           </div>
           <div class="next-print meta" id="next-{p["id"]}">Next print: calculating...</div>
           <div class="btn-row">
@@ -1534,8 +1540,8 @@ function deleteImage(imageId) {{
         const wasSelected = o.selected;
         o.remove();
         if (wasSelected) {{
-          // Reset dropdown to preset-11 and refresh thumbnail
-          sel.value = 'preset-11';
+          // Reset dropdown to preset-4 and refresh thumbnail
+          sel.value = 'preset-4';
           const id = sel.id.replace('img-', '');
           refreshThumb(id);
         }}

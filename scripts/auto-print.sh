@@ -133,7 +133,8 @@ fields = {
     'PAPER_SIZE': p.get('paper_size', 'A4'),
     'SKIP_HOURS': p.get('skip_hours', 72),
     'IS_PAUSED': p.get('paused', False),
-    'TEST_IMAGE_ID': p.get('test_image', 'preset-11'),
+    'VARY_POSITION': p.get('vary_position', False),
+    'TEST_IMAGE_ID': p.get('test_image', 'preset-4'),
 }
 for k, v in fields.items():
     print(f'{k}={shlex.quote(str(v))}')
@@ -183,7 +184,7 @@ print(last)
     fi
 fi
 
-# ── Resolve and stamp the test image ─────────────────────────────
+# ── Resolve the test image ───────────────────────────────────────
 resolve_image() {
     local img_id="$1"
     if [[ "$img_id" == preset-* ]]; then
@@ -196,23 +197,16 @@ resolve_image() {
     fi
     # Fallback
     if [ -f "/app/test-print.png" ]; then echo "/app/test-print.png"; return; fi
-    echo "${PRESETS_DIR}/preset-11.png"
+    echo "${PRESETS_DIR}/preset-4.png"
 }
 
 IMAGE_ORIG=$(resolve_image "$TEST_IMAGE_ID")
-STAMPED_IMAGE="/tmp/stamped-${PRINTER_ID}.png"
-if python3 /app/stamp_image.py "$IMAGE_ORIG" "$STAMPED_IMAGE" "$PRINTER_NAME" "$PRINTER_IP" "$PRINTER_MODEL" 2>/dev/null; then
-    IMAGE="$STAMPED_IMAGE"
-else
-    log "WARNING: Could not stamp image, using original"
-    IMAGE="$IMAGE_ORIG"
-fi
 
 log "Printer: $PRINTER_NAME ($CUPS_NAME) | Image: $TEST_IMAGE_ID"
 
 # ── Pre-flight ──────────────────────────────────────────────────
-if [ ! -f "$IMAGE" ]; then
-    fail print_failed "Test image not found at $IMAGE"
+if [ ! -f "$IMAGE_ORIG" ]; then
+    fail print_failed "Test image not found at $IMAGE_ORIG"
 fi
 
 # cupsd runs under the entrypoint, which restarts the container if it exits.
@@ -240,6 +234,28 @@ STALE_JOBS=$({ lpstat -o "$CUPS_NAME" 2>/dev/null || true; } | wc -l)
 if [ "$STALE_JOBS" -gt 0 ]; then
     log "Cancelling $STALE_JOBS unfinished job(s) from earlier runs."
     cancel -a "$CUPS_NAME" 2>/dev/null || true
+fi
+
+# ── Compose the page ─────────────────────────────────────────────
+# Draws the image and a printer-info footer at the printer's resolution, sized to
+# the printable area in the queue's PPD. Presets are drawn fresh at that size.
+PAGE_IMAGE="/tmp/page-${PRINTER_ID}.png"
+COMPOSE_ARGS=(--ppd "/etc/cups/ppd/${CUPS_NAME}.ppd" --media "$PAPER_SIZE"
+              --name "$PRINTER_NAME" --ip "$PRINTER_IP" --model "$PRINTER_MODEL")
+if [[ "$TEST_IMAGE_ID" =~ ^preset-([0-9]+)$ ]] && [ "$IMAGE_ORIG" = "${PRESETS_DIR}/${TEST_IMAGE_ID}.png" ]; then
+    COMPOSE_ARGS+=(--preset "${BASH_REMATCH[1]}")
+else
+    COMPOSE_ARGS+=(--image "$IMAGE_ORIG")
+fi
+if [ "$VARY_POSITION" = "True" ]; then
+    COMPOSE_ARGS+=(--vary-position)
+fi
+if COMPOSE_OUTPUT=$(python3 /app/compose_page.py "$PAGE_IMAGE" "${COMPOSE_ARGS[@]}" 2>&1); then
+    IMAGE="$PAGE_IMAGE"
+    log "$COMPOSE_OUTPUT"
+else
+    log "WARNING: Could not compose the page. Printing the image as is: $(echo "$COMPOSE_OUTPUT" | tail -n 1)"
+    IMAGE="$IMAGE_ORIG"
 fi
 
 # ── Send print job (with retry) ──────────────────────────────────

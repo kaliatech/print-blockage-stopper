@@ -22,6 +22,7 @@ DEFAULT_SCHEDULE = "0 10 */3 * *"
 CRON_FIELD = r"[0-9*/,-]+"
 CRON_SCHEDULE = re.compile(rf"^{CRON_FIELD}( {CRON_FIELD}){{4}}$")
 FIELD_SEP = "\x1f"
+PPD_WAIT_SECONDS = 30
 
 
 def read_printers():
@@ -54,7 +55,8 @@ def register_queue(printer):
          # Abort a failed job instead of stopping the queue, so it can't block later prints.
          "-o", "printer-error-policy=abort-job"],
         check=True, capture_output=True, text=True, timeout=30)
-    for _ in range(5):
+    # CUPS builds the PPD after lpadmin returns. A sleeping printer can take a while to answer.
+    for _ in range(PPD_WAIT_SECONDS):
         if os.path.exists(ppd_path(name)):
             break
         time.sleep(1)
