@@ -7,9 +7,11 @@ services:
       - "8631:8631"
     volumes:
       - ./data:/data
-    # Same restrictions as the upstream Unraid template.
+    # Docker's default capability set cut down to what CUPS needs (tested against a simulated IPP printer).
+    #   CHOWN, DAC_OVERRIDE: cupsd prepares its spool and local auth cert. Without them, jobs or adding printers fail.
+    #   SETUID, SETGID: cupsd runs print filters as the lp user. Without them, jobs never finish.
     cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    cap_add: [CHOWN, DAC_OVERRIDE, SETUID, SETGID]
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped

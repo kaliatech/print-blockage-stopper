@@ -103,6 +103,37 @@ Each channel has a **Test** button to verify your setup.
 - Printer powered on with paper loaded
 - Network access from Docker host to printer
 
+## Published image
+
+`.github/workflows/docker-publish.yml` builds and pushes `ghcr.io/kaliatech/print-blockage-stopper` when a `v*` tag is pushed.
+
+| Trigger | Image tags |
+|---|---|
+| Push tag `v1.2.3` | `1.2.3`, `latest` |
+| Push tag `v1.3.0-rc.1` | `1.3.0-rc.1` |
+| Manual run on a tag | same as pushing that tag |
+| Manual run on a branch | builds, pushes nothing |
+
+```bash
+git tag -a v1.0.0 -m "v1.0.0"
+git push origin v1.0.0
+```
+
+```yaml
+services:
+  print-blockage-stopper:
+    image: ghcr.io/kaliatech/print-blockage-stopper:latest
+    ports:
+      - "8631:8631"
+    volumes:
+      - ./data:/data
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, SETUID, SETGID]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+```
+
 ## License
 
 MIT
